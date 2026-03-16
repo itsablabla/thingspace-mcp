@@ -1,0 +1,1 @@
+{"name":"thingspace-mcp","version":"2.0.1","type":"module","main":"server.js","scripts":{"start":"node server.js"},"dependencies":{"express":"^4.18.2"}}
