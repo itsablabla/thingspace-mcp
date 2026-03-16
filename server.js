@@ -10,37 +10,63 @@ const TS_PASSWORD = process.env.TS_PASSWORD || 'uqBcCKj29g@f1';
 const ACCOUNT = process.env.TS_ACCOUNT || '0742559388-00001';
 const BASE = 'https://thingspace.verizon.com/api/m2m/v1';
 
-// ─── Token Cache ──────────────────────────────────────────────────────────────
+const CHARGEBEE_SITE = process.env.CHARGEBEE_SITE || 'nomadinternet';
+const CHARGEBEE_API_KEY = process.env.CHARGEBEE_API_KEY || '';
+
+// ─── Token Cache (Layer 1) ─────────────────────────────────────────────────────
 let oauthToken = null, oauthExpiry = 0;
 let sessionToken = null, sessionExpiry = 0;
 
+// ─── Device Cache (Layer 2) ────────────────────────────────────────────────────
+const deviceCache = new Map(); // key -> { data, expiry }
+const DEVICE_CACHE_TTL = 5 * 60 * 1000; // 5 min
+
+// ─── Email→Device Cache (Layer 3) ─────────────────────────────────────────────
+const emailDeviceCache = new Map(); // email -> { deviceId, iccid, mdn, expiry }
+const EMAIL_CACHE_TTL = 10 * 60 * 1000; // 10 min
+
+// ─── In-flight deduplication ───────────────────────────────────────────────────
+const inFlight = new Map();
+
+function dedup(key, fn) {
+  if (inFlight.has(key)) return inFlight.get(key);
+  const p = fn().finally(() => inFlight.delete(key));
+  inFlight.set(key, p);
+  return p;
+}
+
+// ─── Auth ──────────────────────────────────────────────────────────────────────
 async function getOAuth() {
   if (oauthToken && Date.now() < oauthExpiry - 30000) return oauthToken;
-  const res = await fetch('https://thingspace.verizon.com/api/ts/v1/oauth2/token', {
-    method: 'POST',
-    headers: { Authorization: `Basic ${BASIC_AUTH}`, 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: 'grant_type=client_credentials'
+  return dedup('oauth', async () => {
+    const res = await fetch('https://thingspace.verizon.com/api/ts/v1/oauth2/token', {
+      method: 'POST',
+      headers: { Authorization: `Basic ${BASIC_AUTH}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'grant_type=client_credentials'
+    });
+    const d = await res.json();
+    if (!d.access_token) throw new Error(`OAuth failed: ${JSON.stringify(d)}`);
+    oauthToken = d.access_token;
+    oauthExpiry = Date.now() + d.expires_in * 1000;
+    return oauthToken;
   });
-  const d = await res.json();
-  if (!d.access_token) throw new Error(`OAuth failed: ${JSON.stringify(d)}`);
-  oauthToken = d.access_token;
-  oauthExpiry = Date.now() + d.expires_in * 1000;
-  return oauthToken;
 }
 
 async function getSession() {
   if (sessionToken && Date.now() < sessionExpiry - 30000) return sessionToken;
-  const oauth = await getOAuth();
-  const res = await fetch(`${BASE}/session/login`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${oauth}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username: TS_USERNAME, password: TS_PASSWORD })
+  return dedup('session', async () => {
+    const oauth = await getOAuth();
+    const res = await fetch(`${BASE}/session/login`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${oauth}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: TS_USERNAME, password: TS_PASSWORD })
+    });
+    const d = await res.json();
+    if (!d.sessionToken) throw new Error(`Session login failed: ${JSON.stringify(d)}`);
+    sessionToken = d.sessionToken;
+    sessionExpiry = Date.now() + 14 * 60 * 1000;
+    return sessionToken;
   });
-  const d = await res.json();
-  if (!d.sessionToken) throw new Error(`Session login failed: ${JSON.stringify(d)}`);
-  sessionToken = d.sessionToken;
-  sessionExpiry = Date.now() + 14 * 60 * 1000;
-  return sessionToken;
 }
 
 async function tsHeaders() {
@@ -62,7 +88,7 @@ async function tsPost(path, body) {
   try { return { status: r.status, data: JSON.parse(t) }; } catch { return { status: r.status, data: t }; }
 }
 
-// Build deviceList for action endpoints
+// ─── Helpers ───────────────────────────────────────────────────────────────────
 function deviceList(deviceId) {
   const clean = deviceId.replace(/\D/g, '');
   let kind = 'imei';
@@ -71,12 +97,206 @@ function deviceList(deviceId) {
   return [{ deviceIds: [{ id: clean, kind }] }];
 }
 
+function cacheGet(map, key) {
+  const entry = map.get(key);
+  if (!entry || Date.now() > entry.expiry) { map.delete(key); return null; }
+  return entry.data;
+}
+
+function cacheSet(map, key, data, ttl) {
+  map.set(key, { data, expiry: Date.now() + ttl });
+}
+
+// ─── Chargebee ────────────────────────────────────────────────────────────────
+async function chargebeeGet(path) {
+  if (!CHARGEBEE_API_KEY) return null;
+  const res = await fetch(`https://${CHARGEBEE_SITE}.chargebee.com/api/v2${path}`, {
+    headers: { Authorization: 'Basic ' + Buffer.from(CHARGEBEE_API_KEY + ':').toString('base64') }
+  });
+  if (!res.ok) return null;
+  return res.json();
+}
+
+async function getChargebeeCustomerByEmail(email) {
+  const cached = cacheGet(emailDeviceCache, `cb:${email}`);
+  if (cached) return cached;
+
+  const data = await chargebeeGet(`/customers?email=${encodeURIComponent(email)}&limit=1`);
+  if (!data || !data.list?.length) return null;
+
+  const customer = data.list[0].customer;
+  const result = {
+    customerId: customer.id,
+    name: `${customer.first_name || ''} ${customer.last_name || ''}`.trim() || customer.email,
+    email: customer.email,
+    // Custom fields where ICCID / SIM is stored
+    simId: customer.cf_SIM_ID_ICCID || customer.cf_sim_id || customer.cf_iccid || null,
+    subscriptionStatus: null,
+    planId: null
+  };
+
+  // Fetch subscription too
+  const subs = await chargebeeGet(`/subscriptions?customer_id=${customer.id}&limit=1`);
+  if (subs?.list?.length) {
+    const sub = subs.list[0].subscription;
+    result.subscriptionStatus = sub.status;
+    result.planId = sub.plan_id;
+    result.currentTermEnd = sub.current_term_end;
+  }
+
+  cacheSet(emailDeviceCache, `cb:${email}`, result, EMAIL_CACHE_TTL);
+  return result;
+}
+
+// ─── find_device_by_email: Chargebee + ThingSpace combined ────────────────────
+async function findDeviceByEmail(email) {
+  const cacheKey = `email:${email.toLowerCase()}`;
+  const cached = cacheGet(emailDeviceCache, cacheKey);
+  if (cached) return { ...cached, fromCache: true };
+
+  // Step 1: Chargebee lookup
+  const cb = await getChargebeeCustomerByEmail(email);
+
+  let deviceId = cb?.simId || null;
+  let searchMethod = 'chargebee_sim_field';
+
+  // Step 2: If no SIM from Chargebee, scan ThingSpace custom fields for email match
+  // ThingSpace stores notes in CustomField3/4/5 — search by paging
+  if (!deviceId) {
+    searchMethod = 'thingspace_scan';
+    let body = { accountName: ACCOUNT, maxResults: 100 };
+    let hasMore = true;
+    let lastSeen = null;
+    const emailLower = email.toLowerCase();
+
+    outer: while (hasMore) {
+      if (lastSeen) body.lastSeenDeviceId = lastSeen;
+      const r = await tsPost('/devices/actions/list', body);
+      if (r.status !== 200) break;
+      const devices = r.data.devices || [];
+      for (const d of devices) {
+        const fields = (d.customFields || []).map(f => (f.value || '').toLowerCase());
+        if (fields.some(v => v.includes(emailLower))) {
+          const iccid = d.deviceIds?.find(x => x.kind === 'iccId' || x.kind === 'iccid')?.id;
+          const mdn = d.deviceIds?.find(x => x.kind === 'mdn')?.id;
+          deviceId = iccid || mdn || d.deviceIds?.[0]?.id;
+          break outer;
+        }
+      }
+      hasMore = r.data.hasMoreData;
+      lastSeen = devices[devices.length - 1]?.deviceIds?.[0]?.id;
+      if (devices.length === 0) break;
+    }
+  }
+
+  if (!deviceId) {
+    return {
+      success: false,
+      email,
+      chargebeeCustomer: cb || null,
+      error: 'No device found linked to this email in Chargebee or ThingSpace'
+    };
+  }
+
+  // Step 3: Get device details from ThingSpace
+  const clean = deviceId.replace(/\D/g, '');
+  let kind = 'imei';
+  if (clean.length >= 19) kind = 'iccid';
+  else if (clean.length === 10) kind = 'mdn';
+
+  let deviceDetails = cacheGet(deviceCache, deviceId);
+  if (!deviceDetails) {
+    let body = { accountName: ACCOUNT, maxResults: 100 };
+    let hasMore = true;
+    let lastSeen2 = null;
+    while (hasMore && !deviceDetails) {
+      if (lastSeen2) body.lastSeenDeviceId = lastSeen2;
+      const r = await tsPost('/devices/actions/list', body);
+      if (r.status !== 200) break;
+      const devices = r.data.devices || [];
+      deviceDetails = devices.find(d => d.deviceIds?.some(x =>
+        (x.kind === kind || x.kind === 'iccId') && x.id.includes(clean)
+      ));
+      hasMore = r.data.hasMoreData;
+      lastSeen2 = devices[devices.length - 1]?.deviceIds?.[0]?.id;
+      if (devices.length === 0) break;
+    }
+    if (deviceDetails) cacheSet(deviceCache, deviceId, deviceDetails, DEVICE_CACHE_TTL);
+  }
+
+  const result = {
+    success: true,
+    email,
+    searchMethod,
+    chargebeeCustomer: cb || null,
+    device: deviceDetails ? {
+      imei: deviceDetails.deviceIds?.find(x => x.kind === 'imei')?.id,
+      mdn: deviceDetails.deviceIds?.find(x => x.kind === 'mdn')?.id,
+      iccid: deviceDetails.deviceIds?.find(x => x.kind === 'iccId' || x.kind === 'iccid')?.id,
+      state: deviceDetails.carrierInformations?.[0]?.state,
+      connected: deviceDetails.connected,
+      servicePlan: deviceDetails.carrierInformations?.[0]?.servicePlan,
+      customFields: deviceDetails.customFields,
+      billingCycleEnd: deviceDetails.billingCycleEndDate
+    } : null
+  };
+
+  cacheSet(emailDeviceCache, cacheKey, result, EMAIL_CACHE_TTL);
+  return result;
+}
+
+// ─── check_subscription_status ────────────────────────────────────────────────
+async function checkSubscriptionStatus(email) {
+  const cb = await getChargebeeCustomerByEmail(email);
+  if (!cb) return { success: false, email, error: 'Customer not found in Chargebee' };
+
+  const active = cb.subscriptionStatus === 'active';
+  const pastDue = cb.subscriptionStatus === 'past_due';
+
+  return {
+    success: true,
+    email,
+    customerId: cb.customerId,
+    name: cb.name,
+    subscriptionStatus: cb.subscriptionStatus || 'unknown',
+    planId: cb.planId,
+    isActive: active,
+    isPastDue: pastDue,
+    canService: active && !pastDue,
+    currentTermEnd: cb.currentTermEnd
+      ? new Date(cb.currentTermEnd * 1000).toISOString().split('T')[0]
+      : null
+  };
+}
+
 // ─── MCP Tools ────────────────────────────────────────────────────────────────
 const TOOLS = [
   {
     name: 'get_account_info',
     description: 'Get Nomad Internet ThingSpace account details, service plans, and IP pools',
     inputSchema: { type: 'object', properties: {} }
+  },
+  {
+    name: 'find_device_by_email',
+    description: 'Find a customer\'s device by their email address. Searches Chargebee for SIM/ICCID link, then ThingSpace for device details. Returns device state, MDN, ICCID, subscription status, and billing info in one call.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        email: { type: 'string', description: 'Customer email address' }
+      },
+      required: ['email']
+    }
+  },
+  {
+    name: 'check_subscription_status',
+    description: 'Validate customer billing status before service actions. Checks if subscription is active and account has no past due invoices.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        email: { type: 'string', description: 'Customer email address' }
+      },
+      required: ['email']
+    }
   },
   {
     name: 'list_devices',
@@ -175,6 +395,14 @@ const TOOLS = [
 async function handle(name, args) {
   switch (name) {
 
+    case 'find_device_by_email': {
+      return findDeviceByEmail(args.email);
+    }
+
+    case 'check_subscription_status': {
+      return checkSubscriptionStatus(args.email);
+    }
+
     case 'get_account_info': {
       const r = await tsGet(`/accounts/${ACCOUNT}`);
       if (r.status !== 200) return { success: false, status: r.status, error: r.data };
@@ -198,24 +426,17 @@ async function handle(name, args) {
       };
       if (args.startIndex) body.lastSeenDeviceId = args.startIndex;
 
-      // Build filter
       const filter = {};
       if (args.status) filter.deviceState = args.status;
       if (Object.keys(filter).length) body.filter = filter;
 
-      // If searching by specific ID, list and filter client-side
       const r = await tsPost('/devices/actions/list', body);
       if (r.status !== 200) return { success: false, status: r.status, error: r.data };
 
       let devices = r.data.devices || [];
 
-      // Client-side filter by ID type
-      if (args.imei) {
-        devices = devices.filter(d => d.deviceIds?.some(x => x.kind === 'imei' && x.id === args.imei));
-      }
-      if (args.mdn) {
-        devices = devices.filter(d => d.deviceIds?.some(x => x.kind === 'mdn' && x.id === args.mdn));
-      }
+      if (args.imei) devices = devices.filter(d => d.deviceIds?.some(x => x.kind === 'imei' && x.id === args.imei));
+      if (args.mdn) devices = devices.filter(d => d.deviceIds?.some(x => x.kind === 'mdn' && x.id === args.mdn));
       if (args.iccid) {
         devices = devices.filter(d =>
           d.deviceIds?.some(x => x.kind === 'iccid' && x.id.includes(args.iccid)) ||
@@ -243,13 +464,14 @@ async function handle(name, args) {
     }
 
     case 'get_device_details': {
-      // List all devices and find the one matching the ID
+      const cached = cacheGet(deviceCache, args.deviceId);
+      if (cached) return { success: true, device: cached, fromCache: true };
+
       const clean = args.deviceId.replace(/\D/g, '');
       let kind = 'imei';
       if (clean.length >= 19) kind = 'iccid';
       else if (clean.length === 10) kind = 'mdn';
 
-      // Page through devices to find matching one
       let body = { accountName: ACCOUNT, maxResults: 100 };
       let found = null;
       let hasMore = true;
@@ -269,6 +491,7 @@ async function handle(name, args) {
       }
 
       if (!found) return { success: false, error: `Device ${args.deviceId} not found` };
+      cacheSet(deviceCache, args.deviceId, found, DEVICE_CACHE_TTL);
       return { success: true, device: found };
     }
 
@@ -350,7 +573,7 @@ app.post('/mcp', async (req, res) => {
       result: {
         protocolVersion: '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'thingspace-mcp', version: '2.0.0' }
+        serverInfo: { name: 'thingspace-mcp', version: '2.1.0' }
       }
     });
   }
@@ -381,8 +604,8 @@ app.post('/mcp', async (req, res) => {
 });
 
 app.get('/health', (_, res) =>
-  res.json({ status: 'ok', service: 'thingspace-mcp', version: '2.0.0', account: ACCOUNT })
+  res.json({ status: 'ok', service: 'thingspace-mcp', version: '2.1.0', account: ACCOUNT })
 );
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`ThingSpace MCP v2.0 on port ${PORT}`));
+app.listen(PORT, () => console.log(`ThingSpace MCP v2.1.0 on port ${PORT}`));
