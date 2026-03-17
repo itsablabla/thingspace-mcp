@@ -160,45 +160,22 @@ async function findDeviceByEmail(email) {
   let deviceId = cb?.simId || null;
   let searchMethod = 'chargebee_sim_field';
 
-  // Step 2: If no SIM from Chargebee, scan ThingSpace custom fields for email match
-  // ThingSpace stores notes in CustomField3/4/5 — search by paging
-  if (!deviceId) {
-    searchMethod = 'thingspace_scan';
-    let body = { accountName: ACCOUNT, maxResults: 100 };
-    let hasMore = true;
-    let lastSeen = null;
-    const emailLower = email.toLowerCase();
-
-    outer: while (hasMore) {
-      if (lastSeen) body.lastSeenDeviceId = lastSeen;
-      const r = await tsPost('/devices/actions/list', body);
-      if (r.status !== 200) break;
-      const devices = r.data.devices || [];
-      for (const d of devices) {
-        const fields = (d.customFields || []).map(f => (f.value || '').toLowerCase());
-        if (fields.some(v => v.includes(emailLower))) {
-          const iccid = d.deviceIds?.find(x => x.kind === 'iccId' || x.kind === 'iccid')?.id;
-          const mdn = d.deviceIds?.find(x => x.kind === 'mdn')?.id;
-          deviceId = iccid || mdn || d.deviceIds?.[0]?.id;
-          break outer;
-        }
-      }
-      hasMore = r.data.hasMoreData;
-      lastSeen = devices[devices.length - 1]?.deviceIds?.[0]?.id;
-      if (devices.length === 0) break;
-    }
-  }
-
+  // Step 2: If no SIM from Chargebee, return early with device_link_missing.
+  // Full ThingSpace scan removed (v2.1.1) — custom fields don't store emails,
+  // so scanning was O(N) over all devices and always timed out.
+  // Fix: populate cf_SIM_ID_ICCID in Chargebee when a device is assigned.
   if (!deviceId) {
     return {
       success: false,
       email,
       chargebeeCustomer: cb || null,
-      error: 'No device found linked to this email in Chargebee or ThingSpace'
+      device_link_missing: true,
+      error: 'No ICCID found in Chargebee customer record. Populate cf_SIM_ID_ICCID to enable device lookup.'
     };
   }
 
-  // Step 3: Get device details from ThingSpace
+
+  // Step 3: Get device details from ThingSpace via direct ICCID/MDN lookup
   const clean = deviceId.replace(/\D/g, '');
   let kind = 'imei';
   if (clean.length >= 19) kind = 'iccid';
@@ -206,21 +183,14 @@ async function findDeviceByEmail(email) {
 
   let deviceDetails = cacheGet(deviceCache, deviceId);
   if (!deviceDetails) {
-    let body = { accountName: ACCOUNT, maxResults: 100 };
-    let hasMore = true;
-    let lastSeen2 = null;
-    while (hasMore && !deviceDetails) {
-      if (lastSeen2) body.lastSeenDeviceId = lastSeen2;
-      const r = await tsPost('/devices/actions/list', body);
-      if (r.status !== 200) break;
-      const devices = r.data.devices || [];
-      deviceDetails = devices.find(d => d.deviceIds?.some(x =>
-        (x.kind === kind || x.kind === 'iccId') && x.id.includes(clean)
-      ));
-      hasMore = r.data.hasMoreData;
-      lastSeen2 = devices[devices.length - 1]?.deviceIds?.[0]?.id;
-      if (devices.length === 0) break;
-    }
+    // Direct lookup by device ID — fast, no scan
+    const r = await tsPost('/devices/actions/list', {
+      accountName: ACCOUNT,
+      deviceList: [{ deviceIds: [{ id: clean, kind }] }],
+      maxResults: 1
+    });
+    const devices = r.status === 200 ? (r.data.devices || []) : [];
+    deviceDetails = devices[0] || null;
     if (deviceDetails) cacheSet(deviceCache, deviceId, deviceDetails, DEVICE_CACHE_TTL);
   }
 
@@ -573,7 +543,7 @@ app.post('/mcp', async (req, res) => {
       result: {
         protocolVersion: '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'thingspace-mcp', version: '2.1.0' }
+        serverInfo: { name: 'thingspace-mcp', version: '2.1.1' }
       }
     });
   }
@@ -604,7 +574,7 @@ app.post('/mcp', async (req, res) => {
 });
 
 app.get('/health', (_, res) =>
-  res.json({ status: 'ok', service: 'thingspace-mcp', version: '2.1.0', account: ACCOUNT })
+  res.json({ status: 'ok', service: 'thingspace-mcp', version: '2.1.1', account: ACCOUNT })
 );
 
 const PORT = process.env.PORT || 3000;
