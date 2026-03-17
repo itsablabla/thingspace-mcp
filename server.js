@@ -150,7 +150,7 @@ async function getChargebeeCustomerByEmail(email) {
 
 // ─── find_device_by_email: Chargebee + ThingSpace combined ────────────────────
 async function findDeviceByEmail(email) {
-  const cacheKey = `email:${email.toLowerCase()}`;
+  const cacheKey = `email:${(email || '').toLowerCase()}`;
   const cached = cacheGet(emailDeviceCache, cacheKey);
   if (cached) return { ...cached, fromCache: true };
 
@@ -249,6 +249,17 @@ const TOOLS = [
   {
     name: 'find_device_by_email',
     description: 'Find a customer\'s device by their email address. Searches Chargebee for SIM/ICCID link, then ThingSpace for device details. Returns device state, MDN, ICCID, subscription status, and billing info in one call.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        email: { type: 'string', description: 'Customer email address' }
+      },
+      required: ['email']
+    }
+  },
+  {
+    name: 'check_billing_status',
+    description: 'Check customer billing and subscription status before service actions. Alias for check_subscription_status. Checks if subscription is active and account has no past due invoices.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -366,11 +377,16 @@ async function handle(name, args) {
   switch (name) {
 
     case 'find_device_by_email': {
-      return findDeviceByEmail(args.email);
+      const email = args.email || args.Email || args.EMAIL;
+      if (!email) throw new Error('Email is required');
+      return findDeviceByEmail(email);
     }
 
+    case 'check_billing_status':
     case 'check_subscription_status': {
-      return checkSubscriptionStatus(args.email);
+      const email = args.email || args.Email || args.EMAIL;
+      if (!email) throw new Error('Email is required');
+      return checkSubscriptionStatus(email);
     }
 
     case 'get_account_info': {
@@ -543,7 +559,7 @@ app.post('/mcp', async (req, res) => {
       result: {
         protocolVersion: '2024-11-05',
         capabilities: { tools: {} },
-        serverInfo: { name: 'thingspace-mcp', version: '2.1.1' }
+        serverInfo: { name: 'thingspace-mcp', version: '2.2.0' }
       }
     });
   }
@@ -574,8 +590,8 @@ app.post('/mcp', async (req, res) => {
 });
 
 app.get('/health', (_, res) =>
-  res.json({ status: 'ok', service: 'thingspace-mcp', version: '2.1.1', account: ACCOUNT })
+  res.json({ status: 'ok', service: 'thingspace-mcp', version: '2.2.0', account: ACCOUNT })
 );
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`ThingSpace MCP v2.1.0 on port ${PORT}`));
+app.listen(PORT, () => console.log(`ThingSpace MCP v2.2.0 on port ${PORT}`));
